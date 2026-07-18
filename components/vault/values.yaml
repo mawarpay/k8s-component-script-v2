@@ -1,0 +1,10 @@
+server:
+  dev:
+    enabled: true
+  ingress:
+    ui:
+      enabled: true
+      ingressClassName: nginx
+      hosts:
+        - host: vault-dev.domainkamu.com
+          paths: ["/"]

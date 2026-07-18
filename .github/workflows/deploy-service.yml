@@ -1,0 +1,126 @@
+name: Reusable Go deploy to EKS
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      namespace:
+        required: false
+        type: string
+        default: dev
+      chart_version:
+        required: false
+        type: string
+        default: "0.1.0"
+      go_version:
+        required: false
+        type: string
+        default: "1.22"
+      run_tests:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_ACCOUNT_ID:
+        required: true
+
+env:
+  AWS_REGION: ap-southeast-1
+  CLUSTER_NAME: dev-cluster
+
+
+jobs:
+  # ---------- Job 1: test (Go) ----------
+  test:
+    runs-on: ubuntu-latest
+    if: inputs.run_tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5 
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+        
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -count=1 -timeout 5m ./...
+
+  # --------- Job 2: build image + deploy ---------
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    needs: [test]
+    # tetap jalan walau job test di-skip (run_tests=false)
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login ke Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push image (dengan layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:latest
+          # cache layer Docker di GitHub - build Go berikutnya jauh lebih cepat
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            GO_VERSION=${{ inputs.go_version }}
+
+      - name: Checkout helm values
+        uses: actions/checkout@v4
+        with:
+          repository: writdev-alt/helm-charts
+          path: helm-charts
+          # Kalau helm-charts private, tambahkan fine-grained PAT:
+          # token: ${{ secrets.GH_PAT_READ_HELM_CHARTS }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+
+      - name: Helm login ke ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | \
+          helm registry login --username AWS --password-stdin \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Deploy dengan Helm
+        run: |
+          helm upgrade --install ${{ inputs.service_name }} \
+          oci://${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/helm/app \
+          --version ${{ inputs.chart_version }} \
+          --namespace ${{ inputs.namespace }} --create-namespace \
+          -f helm-charts/values/${{ inputs.namespace }}/${{ inputs.service_name }}.yaml \
+          --set image.tag=${{ github.sha }} \
+          --wait --timeout 5m
+
+      - name: Verifikasi rollout
+        run: |
+          kubectl rollout status deployment/${{ inputs.service_name }} \
+          -n ${{ inputs.namespace }} --timeout=180s

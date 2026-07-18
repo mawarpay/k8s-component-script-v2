@@ -1,0 +1,78 @@
+name: Deploy cluster components
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "Komponen yang di-deploy"
+        required: true
+        type: choice
+        options: [all, metrics-server, ingress-nginx, kube-prometheus-stack, loki, promtail, vault]
+
+env:
+  AWS_REGION: ap-southeast-1
+  CLUSTER_NAME: dev-cluster
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+
+      - name: Tambah helm repos
+        run: |
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo add hashicorp https://helm.releases.hashicorp.com
+          helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server
+          helm repo update
+
+      - name: metrics-server
+        if: inputs.component == 'metrics-server' || inputs.component == 'all'
+        run: |
+          helm upgrade --install metrics-server metrics-server/metrics-server \
+          -n kube-system --wait
+
+      - name: ingress-nginx
+        if: inputs.component == 'ingress-nginx' || inputs.component == 'all'
+        run: |
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          -n ingress-nginx --create-namespace \
+          -f components/ingress-nginx/values.yaml --wait
+
+      - name: kube-prometheus-stack (Grafana)
+        if: inputs.component == 'kube-prometheus-stack' || inputs.component == 'all'
+        run: |
+          helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+          -n monitoring --create-namespace \
+          -f components/kube-prometheus-stack/values.yaml --wait --timeout 10m
+
+      - name: Loki
+        if: inputs.component == 'loki' || inputs.component == 'all'
+        run: |
+          helm upgrade --install loki grafana/loki \
+          -n monitoring --create-namespace \
+          -f components/loki/values.yaml --wait --timeout 10m
+
+      - name: promtail
+        if: inputs.component == 'promtail' || inputs.component == 'all'
+        run: |
+          helm upgrade --install promtail grafana/promtail \
+          -n monitoring -f components/promtail/values.yaml --wait
+
+      - name: vault
+        if: inputs.component == 'vault' || inputs.component == 'all'
+        run: |
+          helm upgrade --install vault hashicorp/vault \
+          -n vault --create-namespace \
+          -f components/vault/values.yaml --wait --timeout 10m
