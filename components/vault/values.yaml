@@ -6,5 +6,5 @@ server:
       enabled: true
       ingressClassName: nginx
       hosts:
-        - host: vault-dev.domainkamu.com
+        - host: vault-dev.mawarpay.com
           paths: ["/"]
