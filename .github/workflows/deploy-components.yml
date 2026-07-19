@@ -28,7 +28,7 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
 
-      - name: Add Helm repository
+      - name: Add Helm repositories
         run: |
           helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
@@ -41,7 +41,9 @@ jobs:
         if: inputs.component == 'metrics-server' || inputs.component == 'all'
         run: |
           helm upgrade --install metrics-server metrics-server/metrics-server \
-          -n kube-system
+            -n kube-system \
+            -f components/metrics-server/values.yaml \
+            --wait --timeout 5m
 
       - name: ingress-nginx
         if: inputs.component == 'ingress-nginx' || inputs.component == 'all'
