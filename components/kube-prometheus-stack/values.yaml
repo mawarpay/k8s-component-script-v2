@@ -4,7 +4,7 @@ grafana:
     enabled: true
     ingressClassName: nginx
     hosts: 
-      - grafana-dev.domainkamu.com
+      - grafana-dev.mawarpay.com
   persistence:
     enabled: true
     size: 5Gi
