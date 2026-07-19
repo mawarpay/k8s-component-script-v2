@@ -41,7 +41,8 @@ jobs:
         if: inputs.component == 'metrics-server' || inputs.component == 'all'
         run: |
           helm upgrade --install metrics-server metrics-server/metrics-server \
-          -n kube-system --wait
+            -n kube-system \
+            -f components/metrics-server/values.yaml --wait
 
       - name: ingress-nginx
         if: inputs.component == 'ingress-nginx' || inputs.component == 'all'
