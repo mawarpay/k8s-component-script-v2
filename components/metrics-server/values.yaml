@@ -1,3 +1,9 @@
 replicas: 1
-apiService:
-  create: true
+
+args:
+  - --kubelet-insecure-tls
+  - --kubelet-preferred-address-types=InternalIP
+
+# bypass security group
+hostNetwork:
+  enabled: true
