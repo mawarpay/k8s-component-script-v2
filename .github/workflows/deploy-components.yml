@@ -42,39 +42,38 @@ jobs:
         run: |
           helm upgrade --install metrics-server metrics-server/metrics-server \
             -n kube-system \
-            -f components/metrics-server/values.yaml \
-            --wait --timeout 5m
+            -f components/metrics-server/values.yaml
 
       - name: ingress-nginx
         if: inputs.component == 'ingress-nginx' || inputs.component == 'all'
         run: |
           helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
           -n ingress-nginx --create-namespace \
-          -f components/ingress-nginx/values.yaml --wait
+          -f components/ingress-nginx/values.yaml
 
       - name: kube-prometheus-stack (Grafana)
         if: inputs.component == 'kube-prometheus-stack' || inputs.component == 'all'
         run: |
           helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
           -n monitoring --create-namespace \
-          -f components/kube-prometheus-stack/values.yaml --wait --timeout 10m
+          -f components/kube-prometheus-stack/values.yaml
 
       - name: Loki
         if: inputs.component == 'loki' || inputs.component == 'all'
         run: |
           helm upgrade --install loki grafana/loki \
           -n monitoring --create-namespace \
-          -f components/loki/values.yaml --wait --timeout 10m
+          -f components/loki/values.yaml
 
       - name: promtail
         if: inputs.component == 'promtail' || inputs.component == 'all'
         run: |
           helm upgrade --install promtail grafana/promtail \
-          -n monitoring -f components/promtail/values.yaml --wait
+          -n monitoring -f components/promtail/values.yaml
 
       - name: vault
         if: inputs.component == 'vault' || inputs.component == 'all'
         run: |
           helm upgrade --install vault hashicorp/vault \
           -n vault --create-namespace \
-          -f components/vault/values.yaml --wait --timeout 10m
+          -f components/vault/values.yaml
