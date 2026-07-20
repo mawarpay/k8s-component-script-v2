@@ -1,10 +1,13 @@
 server:
   dev:
     enabled: true
+
+ui:
+  enabled: true
   ingress:
-    ui:
-      enabled: true
-      ingressClassName: nginx
-      hosts:
-        - host: vault-dev.mawarpay.com
-          paths: ["/"]
+    enabled: true
+    ingressClassName: nginx
+    hosts:
+      - host: vault-dev.mawarpay.com
+        paths: 
+          - /
