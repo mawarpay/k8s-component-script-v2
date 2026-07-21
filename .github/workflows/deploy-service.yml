@@ -96,7 +96,7 @@ jobs:
       - name: Checkout helm values
         uses: actions/checkout@v4
         with:
-          repository: writdev-alt/helm-charts-v2
+          repository: mawarpay/helm-charts-v2
           path: helm-charts
           # Kalau helm-charts private, tambahkan fine-grained PAT:
           # token: ${{ secrets.GH_PAT_READ_HELM_CHARTS }}
