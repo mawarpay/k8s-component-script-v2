@@ -31,7 +31,7 @@ on:
 
 env:
   AWS_REGION: ap-southeast-1
-  CLUSTER_NAME: dev-cluster
+  CLUSTER_NAME: dev
 
 
 jobs:
