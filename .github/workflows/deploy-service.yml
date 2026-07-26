@@ -131,4 +131,4 @@ jobs:
       - name: Verifikasi rollout
         run: |
           kubectl rollout status deployment/${{ inputs.service_name }} \
-          -n ${{ inputs.namespace }} --timeout=180s
+          -n default --timeout=180s
