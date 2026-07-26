@@ -112,7 +112,7 @@ jobs:
 
       - name: Deploy dengan Helm
         run: |
-          STAGE="${{ inputs.stage }}
+          STAGE="${{ inputs.stage }}"
           STAGE=${STAGE:-dev}
           
           EXTRA_ARGS=""
