@@ -112,24 +112,13 @@ jobs:
 
       - name: Deploy dengan Helm
         run: |
-          STAGE="${{ inputs.stage }}"
-          STAGE=${STAGE:-dev}
-          
-          EXTRA_ARGS=""
-          if [ "$HAS_CONFIG_FILE" = "true" ]; then
-            EXTRA_ARGS="--set configFile.enabled=true --set-file configFile.content=app-config.yaml"
-          fi
-          
           helm upgrade --install ${{ inputs.service_name }} \
-            oci://${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/helm/app \
-            --version ${{ inputs.chart_version }} \
-            --namespace $NAMESPACE --create-namespace \
-            -f helm-charts/values/$STAGE/${{ inputs.service_name }}.yaml \
-            --set image.tag=${{ github.sha }} \
-            --set vault.enabled=true \
-            --set vault.stage=$STAGE \
-            $EXTRA_ARGS \
-            --timeout 5m
+          oci://${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/helm/app \
+          --version ${{ inputs.chart_version }} \
+          --namespace ${{ inputs.namespace }} --create-namespace \
+          -f helm-charts/values/${{ inputs.namespace }}/${{ inputs.service_name }}.yaml \
+          --set image.tag=${{ github.sha }} \
+          --wait --timeout 5m
 
       - name: Verifikasi rollout
         run: |
