@@ -72,6 +72,25 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Bikin ECR repository kalau belum ada, biar service baru nggak gagal
+      # di step "Build & push image" dengan RepositoryNotFoundException.
+      - name: Pastikan ECR repository ada
+        env:
+          SVC: ${{ inputs.service_name }}
+        run: |
+          if aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$SVC" >/dev/null 2>&1; then
+            echo "ECR repository '$SVC' sudah ada."
+          else
+            echo "ECR repository '$SVC' belum ada - membuat..."
+            aws ecr create-repository \
+              --region "$AWS_REGION" \
+              --repository-name "$SVC" \
+              --image-tag-mutability MUTABLE \
+              --encryption-configuration encryptionType=AES256 >/dev/null \
+            || aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$SVC" >/dev/null
+            echo "ECR repository '$SVC' siap."
+          fi
+
       - name: Login ke Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
