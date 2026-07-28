@@ -1,10 +1,36 @@
 server:
   dev:
+    enabled: false
+
+  ha:
+    enabled: false
+
+  standalone:
     enabled: true
+    config: |
+      ui = true
+      listener "tcp" {
+        tls_disable = 1
+        address     = "[::]:8200"
+        cluster_address = "[::]:8201"
+      }
+      storage "raft" {
+        path = "/vault/data"
+      }
+
+  dataStorage:
+    enabled: true
+    size: 10Gi
+    storageClass: "gp2" 
+    accessMode: ReadWriteOnce
+    mountPath: "/vault/data"
+
   ingress:
     enabled: true
     ingressClassName: nginx
     hosts:
       - host: vault-dev.mawarpay.com
-        paths:
-          - /
+        paths: ["/"]
+
+injector:
+  enabled: true

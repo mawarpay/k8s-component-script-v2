@@ -1,0 +1,22 @@
+{
+    "sourceFile": "components/vault/values.yaml",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 1,
+            "patches": [
+                {
+                    "date": 1785222084907,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                },
+                {
+                    "date": 1785222409511,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -20,17 +20,17 @@\n \r\n   dataStorage:\r\n     enabled: true\r\n     size: 10Gi\r\n-    storageClass: \"gp3\" \r\n+    storageClass: \"gp2\" \r\n     accessMode: ReadWriteOnce\r\n     mountPath: \"/vault/data\"\r\n \r\n   ingress:\r\n     enabled: true\r\n     ingressClassName: nginx\r\n     hosts:\r\n-      - host: vault-dev.domainkamu.com\r\n+      - host: vault-dev.mawarpay.com\r\n         paths: [\"/\"]\r\n \r\n injector:\r\n   enabled: true\n\\ No newline at end of file\n"
+                }
+            ],
+            "date": 1785222084907,
+            "name": "Commit-0",
+            "content": "server:\r\n  dev:\r\n    enabled: false\r\n\r\n  ha:\r\n    enabled: false\r\n\r\n  standalone:\r\n    enabled: true\r\n    config: |\r\n      ui = true\r\n      listener \"tcp\" {\r\n        tls_disable = 1\r\n        address     = \"[::]:8200\"\r\n        cluster_address = \"[::]:8201\"\r\n      }\r\n      storage \"raft\" {\r\n        path = \"/vault/data\"\r\n      }\r\n\r\n  dataStorage:\r\n    enabled: true\r\n    size: 10Gi\r\n    storageClass: \"gp3\" \r\n    accessMode: ReadWriteOnce\r\n    mountPath: \"/vault/data\"\r\n\r\n  ingress:\r\n    enabled: true\r\n    ingressClassName: nginx\r\n    hosts:\r\n      - host: vault-dev.domainkamu.com\r\n        paths: [\"/\"]\r\n\r\ninjector:\r\n  enabled: true"
+        }
+    ]
+}
