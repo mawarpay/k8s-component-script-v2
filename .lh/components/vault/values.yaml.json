@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 1,
+            "activePatchIndex": 2,
             "patches": [
                 {
                     "date": 1785222084907,
@@ -12,6 +12,10 @@
                 {
                     "date": 1785222409511,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -20,17 +20,17 @@\n \r\n   dataStorage:\r\n     enabled: true\r\n     size: 10Gi\r\n-    storageClass: \"gp3\" \r\n+    storageClass: \"gp2\" \r\n     accessMode: ReadWriteOnce\r\n     mountPath: \"/vault/data\"\r\n \r\n   ingress:\r\n     enabled: true\r\n     ingressClassName: nginx\r\n     hosts:\r\n-      - host: vault-dev.domainkamu.com\r\n+      - host: vault-dev.mawarpay.com\r\n         paths: [\"/\"]\r\n \r\n injector:\r\n   enabled: true\n\\ No newline at end of file\n"
+                },
+                {
+                    "date": 1785223565803,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -20,9 +20,9 @@\n \r\n   dataStorage:\r\n     enabled: true\r\n     size: 10Gi\r\n-    storageClass: \"gp2\" \r\n+    storageClass: \"gp3\" \r\n     accessMode: ReadWriteOnce\r\n     mountPath: \"/vault/data\"\r\n \r\n   ingress:\r\n"
                 }
             ],
             "date": 1785222084907,

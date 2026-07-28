@@ -21,7 +21,7 @@ server:
   dataStorage:
     enabled: true
     size: 10Gi
-    storageClass: "gp2" 
+    storageClass: "gp3" 
     accessMode: ReadWriteOnce
     mountPath: "/vault/data"
 
