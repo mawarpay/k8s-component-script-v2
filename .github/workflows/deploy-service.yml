@@ -21,6 +21,14 @@ on:
         required: false
         type: boolean
         default: true
+      system_packages:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Paket apt yang dipasang di runner sebelum go vet/test, dipisah spasi.
+          Dipakai service yang punya dependency cgo (misal image-service-api
+          butuh "libvips-dev" untuk github.com/h2non/bimg).
     secrets:
       AWS_ACCESS_KEY_ID:
         required: true
@@ -42,8 +50,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Dependency cgo (bimg/libvips dsb) butuh header + .pc file di runner,
+      # kalau nggak ada `go vet` gagal di "Package vips was not found".
+      - name: Pasang paket sistem
+        if: inputs.system_packages != ''
+        env:
+          PKGS: ${{ inputs.system_packages }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $PKGS
+
       - name: Setup Go
-        uses: actions/setup-go@v5 
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ inputs.go_version }}
           cache: true
