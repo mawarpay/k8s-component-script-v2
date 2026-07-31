@@ -1,0 +1,282 @@
+name: Reusable Frontend deploy to EKS
+#
+# Variabel VITE_* di-bake saat `vite build` (nggak ada proses runtime yang bisa
+# baca env di balik nginx), jadi nilainya diambil dari Vault sebelum build dan
+# dikirim ke Docker sebagai build-args.
+#
+# Setup Vault yang dibutuhkan sekali per service - lihat catatan di input
+# `vault_secret_path` di bawah.
+#
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      namespace:
+        required: false
+        type: string
+        default: dev
+        description: >-
+          Folder values di repo helm-charts-v2 (values/<namespace>/<service>.yaml).
+          Helm release-nya sendiri tetap dipasang di namespace k8s "default",
+          sama seperti deploy-service.yml.
+      chart_version:
+        required: false
+        type: string
+        default: "0.1.2"
+      node_version:
+        required: false
+        type: string
+        default: "24"
+      run_tests:
+        required: false
+        type: boolean
+        default: true
+        description: >-
+          Jalankan type-check + unit test (vitest) sebelum build image.
+          Script yang nggak ada di package.json otomatis dilewati.
+      vault_addr:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Contoh: https://vault-dev.mawarpay.com. Kalau dikosongin, step Vault
+          di-skip dan nilai VITE_* diambil dari input `api_base_url` /
+          `extra_build_args` aja.
+      vault_mount:
+        required: false
+        type: string
+        default: secret
+        description: Nama mount KV v2 di Vault.
+      vault_secret_path:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Path secret di dalam mount, default "<namespace>/<service_name>".
+          Semua field di path ini dikirim apa adanya sebagai build-arg, jadi
+          nama field harus persis sama dengan nama env Vite. Contoh isi:
+
+            vault kv put -mount=secret dev/portal-admin-vue \
+              VITE_API_BASE_URL=https://api-dev.mawarpay.com \
+              VITE_SENTRY_DSN=https://xxx@sentry.io/123 \
+              VITE_SENTRY_ENVIRONMENT=dev
+
+          Setiap field juga wajib punya `ARG` dengan nama sama di Dockerfile
+          service - build-arg yang nggak dideklarasikan diabaikan Docker.
+      api_base_url:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Fallback VITE_API_BASE_URL kalau Vault nggak dipakai. Ditimpa field
+          dari Vault kalau dua-duanya ada.
+      extra_build_args:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Build args tambahan, satu baris satu KEY=value. Prioritas paling
+          tinggi (menimpa Vault). Jangan taruh nilai sensitif di sini - isinya
+          keliatan di log workflow.
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_ACCOUNT_ID:
+        required: true
+      # Kredensial AppRole buat login ke Vault. Wajib kalau `vault_addr` diisi.
+      VAULT_ROLE_ID:
+        required: false
+      VAULT_SECRET_ID:
+        required: false
+
+env:
+  AWS_REGION: ap-southeast-1
+  CLUSTER_NAME: dev
+
+jobs:
+  # ---------- Job 1: test (Node/Vite) ----------
+  test:
+    runs-on: ubuntu-latest
+    if: inputs.run_tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run type-check --if-present
+
+      - name: Unit test
+        run: npm run test --if-present
+
+  # --------- Job 2: build image + deploy ---------
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    needs: [test]
+    # tetap jalan walau job test di-skip (run_tests=false)
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pasang Vault CLI
+        if: inputs.vault_addr != ''
+        run: |
+          set -euo pipefail
+          wget -qO- https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends vault
+          vault version
+
+      # Semua field di path Vault dikirim apa adanya jadi build-arg, jadi nambah
+      # variabel Vite baru cukup `vault kv patch` + tambah ARG di Dockerfile,
+      # workflow ini nggak perlu diubah.
+      - name: Ambil VITE_* dari Vault
+        id: vault
+        if: inputs.vault_addr != ''
+        shell: bash
+        env:
+          VAULT_ADDR: ${{ inputs.vault_addr }}
+          ROLE_ID: ${{ secrets.VAULT_ROLE_ID }}
+          SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
+          MOUNT: ${{ inputs.vault_mount }}
+          SECRET_PATH: ${{ inputs.vault_secret_path != '' && inputs.vault_secret_path || format('{0}/{1}', inputs.namespace, inputs.service_name) }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$ROLE_ID" ] || [ -z "$SECRET_ID" ]; then
+            echo "::error::vault_addr diisi tapi secret VAULT_ROLE_ID/VAULT_SECRET_ID kosong."
+            exit 1
+          fi
+
+          VAULT_TOKEN="$(vault write -field=token auth/approle/login \
+            role_id="$ROLE_ID" secret_id="$SECRET_ID")"
+          echo "::add-mask::$VAULT_TOKEN"
+          export VAULT_TOKEN
+
+          SECRET_JSON="$(vault kv get -mount="$MOUNT" -format=json "$SECRET_PATH")"
+
+          # Mask dulu nilainya, baru ditulis ke output - biar nggak bocor di log
+          # kalau ada step yang echo build-args. Nilai pendek (misal "dev" atau
+          # "0.1") sengaja nggak di-mask: GitHub nge-mask per substring, jadi
+          # kata umum kayak gitu bikin log lain ikut kesensor jadi "***".
+          while IFS= read -r v; do
+            if [ "${#v}" -ge 8 ]; then
+              echo "::add-mask::$v"
+            fi
+          done < <(jq -r '.data.data[] | tostring' <<<"$SECRET_JSON")
+
+          {
+            echo "build_args<<VAULT_EOF"
+            jq -r '.data.data | to_entries[] | "\(.key)=\(.value)"' <<<"$SECRET_JSON"
+            echo "VAULT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Ambil $(jq -r '.data.data | length' <<<"$SECRET_JSON") field dari ${MOUNT}/${SECRET_PATH}."
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Bikin ECR repository kalau belum ada, biar service baru nggak gagal
+      # di step "Build & push image" dengan RepositoryNotFoundException.
+      - name: Pastikan ECR repository ada
+        env:
+          SVC: ${{ inputs.service_name }}
+        run: |
+          if aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$SVC" >/dev/null 2>&1; then
+            echo "ECR repository '$SVC' sudah ada."
+          else
+            echo "ECR repository '$SVC' belum ada - membuat..."
+            aws ecr create-repository \
+              --region "$AWS_REGION" \
+              --repository-name "$SVC" \
+              --image-tag-mutability MUTABLE \
+              --encryption-configuration encryptionType=AES256 >/dev/null \
+            || aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$SVC" >/dev/null
+            echo "ECR repository '$SVC' siap."
+          fi
+
+      - name: Login ke Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Urutan build-args = urutan prioritas, yang belakang menimpa yang depan:
+      # default workflow -> field Vault -> extra_build_args.
+      - name: Build & push image (dengan layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:latest
+          # cache layer Docker di GitHub - `npm ci` berikutnya jauh lebih cepat
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_VERSION=${{ inputs.node_version }}
+            VITE_API_BASE_URL=${{ inputs.api_base_url }}
+            VITE_SENTRY_RELEASE=${{ inputs.service_name }}@${{ github.sha }}
+            ${{ steps.vault.outputs.build_args }}
+            ${{ inputs.extra_build_args }}
+
+      - name: Checkout helm values
+        uses: actions/checkout@v4
+        with:
+          repository: mawarpay/helm-charts-v2
+          path: helm-charts
+          # Kalau helm-charts private, tambahkan fine-grained PAT:
+          # token: ${{ secrets.GH_PAT_READ_HELM_CHARTS }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+
+      - name: Helm login ke ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | \
+          helm registry login --username AWS --password-stdin \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Helm dry-run (debug manifest)
+        run: |
+          helm upgrade --install ${{ inputs.service_name }} \
+          oci://${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/helm/app \
+          --version ${{ inputs.chart_version }} \
+          --namespace default --create-namespace \
+          -f helm-charts/values/${{ inputs.namespace }}/${{ inputs.service_name }}.yaml \
+          --set image.tag=${{ github.sha }} \
+          --dry-run --debug
+
+      - name: Deploy dengan Helm
+        run: |
+          helm upgrade --install ${{ inputs.service_name }} \
+          oci://${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/helm/app \
+          --version ${{ inputs.chart_version }} \
+          --namespace default --create-namespace \
+          -f helm-charts/values/${{ inputs.namespace }}/${{ inputs.service_name }}.yaml \
+          --set image.tag=${{ github.sha }} \
+          --wait --timeout 5m
+
+      - name: Verifikasi rollout
+        run: |
+          kubectl rollout status deployment/${{ inputs.service_name }} \
+          -n default --timeout=180s
