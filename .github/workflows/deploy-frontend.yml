@@ -87,10 +87,8 @@ on:
         required: true
       AWS_ACCOUNT_ID:
         required: true
-      # Kredensial AppRole buat login ke Vault. Wajib kalau `vault_addr` diisi.
-      VAULT_ROLE_ID:
-        required: false
-      VAULT_SECRET_ID:
+      # Token Vault (org secret). Wajib kalau `vault_addr` diisi.
+      VAULT_TOKEN:
         required: false
 
 env:
@@ -150,22 +148,16 @@ jobs:
         shell: bash
         env:
           VAULT_ADDR: ${{ inputs.vault_addr }}
-          ROLE_ID: ${{ secrets.VAULT_ROLE_ID }}
-          SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
           MOUNT: ${{ inputs.vault_mount }}
           SECRET_PATH: ${{ inputs.vault_secret_path != '' && inputs.vault_secret_path || format('{0}/{1}', inputs.namespace, inputs.service_name) }}
         run: |
           set -euo pipefail
 
-          if [ -z "$ROLE_ID" ] || [ -z "$SECRET_ID" ]; then
-            echo "::error::vault_addr diisi tapi secret VAULT_ROLE_ID/VAULT_SECRET_ID kosong."
+          if [ -z "${VAULT_TOKEN:-}" ]; then
+            echo "::error::vault_addr diisi tapi secret VAULT_TOKEN kosong. Pastikan caller-nya ngoper VAULT_TOKEN di blok secrets - org secret nggak otomatis kebawa ke reusable workflow."
             exit 1
           fi
-
-          VAULT_TOKEN="$(vault write -field=token auth/approle/login \
-            role_id="$ROLE_ID" secret_id="$SECRET_ID")"
-          echo "::add-mask::$VAULT_TOKEN"
-          export VAULT_TOKEN
 
           SECRET_JSON="$(vault kv get -mount="$MOUNT" -format=json "$SECRET_PATH")"
 
