@@ -1,18 +1,37 @@
 name: Reusable Go deploy to EKS
+#
+# Dev dan prod berbagi satu cluster EKS dan satu Vault. Yang membedakan cuma
+# tiga hal, dan ketiganya diturunkan dari input `env` di job `setup` - jangan
+# pernah ditulis manual di step lain:
+#
+#   env    namespace k8s   values                        Vault
+#   dev    default         values/dev/<service>.yaml     secret/dev/*
+#   prod   prod            values/prod/<service>.yaml    secret/prod/*
+#
 on:
   workflow_call:
     inputs:
       service_name:
         required: true
         type: string
+      env:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          "dev" atau "prod". Kalau dikosongkan, dipakai nilai input `namespace`
+          (jalur lama) supaya caller yang belum dimigrasi tetap jalan.
       namespace:
         required: false
         type: string
-        default: dev
+        default: ""
+        description: >-
+          DEPRECATED - alias lama untuk `env`. Dulu namanya "namespace" padahal
+          isinya nama folder values, bukan namespace k8s. Pakai `env`.
       chart_version:
         required: false
         type: string
-        default: "0.1.2"
+        default: "0.1.3"
       go_version:
         required: false
         type: string
@@ -21,6 +40,16 @@ on:
         required: false
         type: boolean
         default: true
+      promote_image:
+        required: false
+        type: boolean
+        default: false
+        description: >-
+          Jangan build image, pakai yang sudah ada di ECR untuk commit ini.
+          Dipakai jalur prod: biner yang jalan di prod jadi persis byte-per-byte
+          yang sudah diuji di dev, bukan hasil compile ulang. Workflow gagal
+          kalau image-nya belum ada - artinya commit ini memang belum pernah
+          lewat dev.
       system_packages:
         required: false
         type: string
@@ -58,13 +87,72 @@ on:
 
 env:
   AWS_REGION: ap-southeast-1
+  # Dev dan prod satu cluster - yang memisahkan keduanya adalah namespace,
+  # bukan cluster.
   CLUSTER_NAME: dev
 
 
 jobs:
+  # ---------- Job 0: turunkan semua yang bergantung environment ----------
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.resolve.outputs.env }}
+      ns: ${{ steps.resolve.outputs.ns }}
+      vault_store: ${{ steps.resolve.outputs.vault_store }}
+      moving_tag: ${{ steps.resolve.outputs.moving_tag }}
+    steps:
+      - name: Resolve environment
+        id: resolve
+        env:
+          RAW_ENV: ${{ inputs.env }}
+          RAW_NS: ${{ inputs.namespace }}
+        run: |
+          set -euo pipefail
+          ENV="${RAW_ENV:-$RAW_NS}"
+
+          case "$ENV" in
+            dev)
+              NS=default
+              STORE=vault-kv
+              MOVING=latest
+              ;;
+            prod)
+              NS=prod
+              # ClusterSecretStore terpisah dengan token Vault yang policy-nya
+              # cuma secret/data/prod/*. Karena dev dan prod satu cluster,
+              # ClusterSecretStore yang sama akan bikin ExternalSecret di
+              # namespace default bisa menarik secret prod - pemisahan path saja
+              # tidak menahan apa pun tanpa ini.
+              STORE=vault-kv-prod
+              MOVING=prod
+              ;;
+            "")
+              echo '::error::input "env" (atau "namespace") wajib diisi: dev | prod.'
+              exit 1
+              ;;
+            *)
+              echo "::error::environment tidak dikenal: '$ENV'. Yang valid: dev | prod."
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$RAW_ENV" ]; then
+            echo "::warning::Caller masih pakai input 'namespace' yang deprecated. Ganti jadi 'env: $ENV'."
+          fi
+
+          echo "env=$ENV" >> "$GITHUB_OUTPUT"
+          echo "ns=$NS" >> "$GITHUB_OUTPUT"
+          echo "vault_store=$STORE" >> "$GITHUB_OUTPUT"
+          echo "moving_tag=$MOVING" >> "$GITHUB_OUTPUT"
+
+          echo "env=$ENV namespace=$NS store=$STORE"
+
   # ---------- Job 1: test (Go) ----------
   test:
     runs-on: ubuntu-latest
+    # Jalur prod mem-promote image yang sudah lolos test di jalur dev, jadi
+    # test-nya tidak diulang - caller prod mengirim run_tests: false.
     if: inputs.run_tests
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +175,7 @@ jobs:
 
       - name: Download modules
         run: go mod download
-        
+
       - name: go vet
         run: go vet ./...
 
@@ -97,9 +185,14 @@ jobs:
   # --------- Job 2: build image + deploy ---------
   build-and-deploy:
     runs-on: ubuntu-latest
-    needs: [test]
+    needs: [setup, test]
     # tetap jalan walau job test di-skip (run_tests=false)
-    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    if: always() && needs.setup.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    env:
+      ENV: ${{ needs.setup.outputs.env }}
+      NS: ${{ needs.setup.outputs.ns }}
+      VAULT_STORE: ${{ needs.setup.outputs.vault_store }}
+      MOVING_TAG: ${{ needs.setup.outputs.moving_tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -131,6 +224,7 @@ jobs:
       # Bikin ECR repository kalau belum ada, biar service baru nggak gagal
       # di step "Build & push image" dengan RepositoryNotFoundException.
       - name: Pastikan ECR repository ada
+        if: ${{ !inputs.promote_image }}
         env:
           SVC: ${{ inputs.service_name }}
           WITH_MIGRATIONS: ${{ steps.migrations.outputs.found }}
@@ -161,28 +255,60 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # ---- jalur promote (prod): tidak build apa pun ----
+      #
+      # Tag git v* menunjuk commit yang sudah pernah di-push ke main, jadi
+      # image-nya sudah dibangun jalur dev. Kalau ternyata belum ada, itu bukan
+      # kondisi yang boleh "diperbaiki" dengan build baru di sini: berarti
+      # commit ini belum pernah dites di dev, dan itu justru yang mau dicegah.
+      - name: Pastikan image sudah ada di ECR
+        if: inputs.promote_image
+        env:
+          SVC: ${{ inputs.service_name }}
+          SHA: ${{ github.sha }}
+          WITH_MIGRATIONS: ${{ steps.migrations.outputs.found }}
+        run: |
+          set -euo pipefail
+          require_image() {
+            if aws ecr describe-images --region "$AWS_REGION" \
+                 --repository-name "$1" --image-ids "imageTag=$SHA" >/dev/null 2>&1; then
+              echo "Image $1:$SHA ditemukan."
+            else
+              echo "::error::Image $1:$SHA belum ada di ECR."
+              echo "Commit ini belum pernah dideploy ke dev. Push ke main dulu, tunggu"
+              echo "jalur dev selesai, baru tag commit yang sama untuk prod."
+              exit 1
+            fi
+          }
+          require_image "$SVC"
+          if [ "$WITH_MIGRATIONS" = "true" ]; then
+            require_image "$SVC-migrations"
+          fi
+
       - name: Setup Docker Buildx
+        if: ${{ !inputs.promote_image }}
         uses: docker/setup-buildx-action@v3
 
       - name: Build & push image (dengan layer cache)
+        if: ${{ !inputs.promote_image }}
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
             ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:${{ github.sha }}
-            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:${{ needs.setup.outputs.moving_tag }}
           # cache layer Docker di GitHub - build Go berikutnya jauh lebih cepat
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
             GO_VERSION=${{ inputs.go_version }}
 
-      # RDS dev (db-mawarpay-dev) tidak publicly accessible, jadi migrasi tidak
-      # bisa dijalankan langsung dari runner GitHub - harus lewat Job di dalam
-      # cluster. Image kecil ini yang dipakai Job tersebut.
+      # RDS tidak publicly accessible, jadi migrasi tidak bisa dijalankan
+      # langsung dari runner GitHub - harus lewat Job di dalam cluster. Image
+      # kecil ini yang dipakai Job tersebut.
       - name: Build & push image migrasi
-        if: steps.migrations.outputs.found == 'true'
+        if: ${{ !inputs.promote_image && steps.migrations.outputs.found == 'true' }}
         env:
           MIGRATIONS_PATH: ${{ inputs.migrations_path }}
           MIGRATE_VERSION: ${{ inputs.migrate_version }}
@@ -199,6 +325,25 @@ jobs:
           docker build -f Dockerfile.migrations -t "$IMG" .
           docker push "$IMG"
 
+      # Tag bergerak ("prod") ditempel ke manifest yang sudah ada, bukan lewat
+      # build ulang - digest-nya harus tetap sama dengan yang diuji di dev.
+      - name: Tempel tag ${{ needs.setup.outputs.moving_tag }} ke image
+        if: inputs.promote_image
+        env:
+          SVC: ${{ inputs.service_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          MANIFEST="$(aws ecr batch-get-image --region "$AWS_REGION" \
+            --repository-name "$SVC" --image-ids "imageTag=$SHA" \
+            --query 'images[0].imageManifest' --output text)"
+          # Gagal kalau tag sudah menunjuk manifest yang sama - itu bukan error.
+          aws ecr put-image --region "$AWS_REGION" \
+            --repository-name "$SVC" --image-tag "$MOVING_TAG" \
+            --image-manifest "$MANIFEST" >/dev/null 2>&1 \
+            || echo "Tag $MOVING_TAG sudah menunjuk image ini."
+          echo "$SVC:$MOVING_TAG -> $SHA"
+
       - name: Checkout helm values
         uses: actions/checkout@v4
         with:
@@ -206,6 +351,21 @@ jobs:
           path: helm-charts
           # Kalau helm-charts private, tambahkan fine-grained PAT:
           # token: ${{ secrets.GH_PAT_READ_HELM_CHARTS }}
+
+      # helm sendiri akan gagal kalau -f menunjuk file yang tidak ada, tapi
+      # errornya ("open ...: no such file") tidak menyebut bahwa yang kurang
+      # adalah values untuk environment ini.
+      - name: Pastikan values environment ada
+        env:
+          SVC: ${{ inputs.service_name }}
+        run: |
+          VALUES="helm-charts/values/$ENV/$SVC.yaml"
+          if [ ! -f "$VALUES" ]; then
+            echo "::error::$VALUES tidak ada di helm-charts-v2."
+            echo "Buat dulu values untuk environment '$ENV' sebelum deploy ke sana."
+            exit 1
+          fi
+          echo "Pakai $VALUES"
 
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
@@ -222,16 +382,18 @@ jobs:
           SECRET="$SVC-vault"
 
           # Secret ini dibuat ExternalSecret milik chart, jadi belum ada waktu
-          # service dideploy paling pertama.
-          if ! kubectl get secret "$SECRET" -n default >/dev/null 2>&1; then
-            echo "::error::Secret '$SECRET' belum ada di namespace default."
-            echo "Untuk deploy pertama kali: jalankan sekali dengan run_migrations: false"
-            echo "supaya ExternalSecret terbentuk, lalu jalankan ulang workflow-nya."
+          # service dideploy paling pertama - termasuk saat service yang sudah
+          # lama jalan di dev pertama kali masuk ke namespace prod.
+          if ! kubectl get secret "$SECRET" -n "$NS" >/dev/null 2>&1; then
+            echo "::error::Secret '$SECRET' belum ada di namespace $NS."
+            echo "Untuk deploy pertama kali ke environment ini: jalankan sekali dengan"
+            echo "run_migrations: false supaya ExternalSecret terbentuk, lalu jalankan"
+            echo "ulang workflow-nya."
             exit 1
           fi
 
           JOB="$SVC-migrate-$(echo "${{ github.sha }}" | cut -c1-7)"
-          kubectl delete job "$JOB" -n default --ignore-not-found
+          kubectl delete job "$JOB" -n "$NS" --ignore-not-found
 
           # Ledger golang-migrate per service.
           #
@@ -249,14 +411,14 @@ jobs:
           # yang sama. Tanda hubung tidak dipakai supaya nama tabel tetap
           # identifier MySQL yang wajar.
           MIG_TABLE="schema_migrations_$(echo "$SVC" | tr '-' '_')"
-          echo "Ledger migrasi: $MIG_TABLE"
+          echo "Ledger migrasi: $MIG_TABLE (namespace $NS)"
 
           kubectl apply -f - <<EOF
           apiVersion: batch/v1
           kind: Job
           metadata:
             name: $JOB
-            namespace: default
+            namespace: $NS
           spec:
             backoffLimit: 0
             ttlSecondsAfterFinished: 600
@@ -321,11 +483,11 @@ jobs:
           deadline=$(( $(date +%s) + 600 ))
           state=timeout
           while [ "$(date +%s)" -lt "$deadline" ]; do
-            if [ "$(kubectl get job "$JOB" -n default -o jsonpath='{.status.succeeded}' 2>/dev/null || true)" = "1" ]; then
+            if [ "$(kubectl get job "$JOB" -n "$NS" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)" = "1" ]; then
               state=ok
               break
             fi
-            failed=$(kubectl get job "$JOB" -n default -o jsonpath='{.status.failed}' 2>/dev/null || true)
+            failed=$(kubectl get job "$JOB" -n "$NS" -o jsonpath='{.status.failed}' 2>/dev/null || true)
             if [ -n "$failed" ] && [ "$failed" != "0" ]; then
               state=fail
               break
@@ -334,16 +496,16 @@ jobs:
           done
 
           echo "----- log migrasi -----"
-          kubectl logs "job/$JOB" -n default --tail=300 || true
+          kubectl logs "job/$JOB" -n "$NS" --tail=300 || true
           echo "-----------------------"
 
           if [ "$state" != "ok" ]; then
             echo "::error::Migrasi $SVC $state - deploy dibatalkan."
-            kubectl describe job "$JOB" -n default || true
+            kubectl describe job "$JOB" -n "$NS" || true
             exit 1
           fi
 
-          kubectl delete job "$JOB" -n default --ignore-not-found
+          kubectl delete job "$JOB" -n "$NS" --ignore-not-found
           echo "Migrasi $SVC selesai."
 
       - name: Helm login ke ECR
@@ -351,26 +513,37 @@ jobs:
           aws ecr get-login-password --region $AWS_REGION | \
           helm registry login --username AWS --password-stdin \
           ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      # vault.stage dan vault.storeName selalu dipaksa dari sini, tidak dibaca
+      # dari file values. Kalau values/prod/<svc>.yaml lupa menyetel keduanya,
+      # default chart (stage dev, store vault-kv) akan bikin pod prod jalan di
+      # atas kredensial dev tanpa satu pun error - kegagalan paling mahal yang
+      # bisa terjadi di setup satu-cluster ini.
       - name: Helm dry-run (debug manifest)
         run: |
           helm upgrade --install ${{ inputs.service_name }} \
           oci://${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/helm/app \
           --version ${{ inputs.chart_version }} \
-          --namespace default --create-namespace \
-          -f helm-charts/values/${{ inputs.namespace }}/${{ inputs.service_name }}.yaml \
+          --namespace "$NS" --create-namespace \
+          -f helm-charts/values/$ENV/${{ inputs.service_name }}.yaml \
           --set image.tag=${{ github.sha }} \
+          --set vault.stage=$ENV \
+          --set vault.storeName=$VAULT_STORE \
           --dry-run --debug
+
       - name: Deploy dengan Helm
         run: |
           helm upgrade --install ${{ inputs.service_name }} \
           oci://${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/helm/app \
           --version ${{ inputs.chart_version }} \
-          --namespace default --create-namespace \
-          -f helm-charts/values/${{ inputs.namespace }}/${{ inputs.service_name }}.yaml \
+          --namespace "$NS" --create-namespace \
+          -f helm-charts/values/$ENV/${{ inputs.service_name }}.yaml \
           --set image.tag=${{ github.sha }} \
+          --set vault.stage=$ENV \
+          --set vault.storeName=$VAULT_STORE \
           --wait --timeout 5m
 
       - name: Verifikasi rollout
         run: |
           kubectl rollout status deployment/${{ inputs.service_name }} \
-          -n default --timeout=180s
+          -n "$NS" --timeout=180s
