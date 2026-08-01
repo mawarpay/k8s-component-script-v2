@@ -233,6 +233,24 @@ jobs:
           JOB="$SVC-migrate-$(echo "${{ github.sha }}" | cut -c1-7)"
           kubectl delete job "$JOB" -n default --ignore-not-found
 
+          # Ledger golang-migrate per service.
+          #
+          # Beberapa service memakai database yang sama (mis. va-service dan
+          # qris-service sama-sama DB_NAME=base), sementara set migrasinya
+          # berbeda. Dengan tabel ledger default (schema_migrations) keduanya
+          # berbagi satu nomor versi: yang migrasi terakhir menang, lalu job
+          # service lain mati dengan
+          #   "no migration found for version N: file does not exist"
+          # karena nomor itu tidak ada di direktori migrations miliknya.
+          # Terbukti di dev 2026-08-01: va-service naik ke 17, qris-service
+          # (maksimum 14) langsung terblokir.
+          #
+          # x-migrations-table memberi tiap service ledger sendiri di database
+          # yang sama. Tanda hubung tidak dipakai supaya nama tabel tetap
+          # identifier MySQL yang wajar.
+          MIG_TABLE="schema_migrations_$(echo "$SVC" | tr '-' '_')"
+          echo "Ledger migrasi: $MIG_TABLE"
+
           kubectl apply -f - <<EOF
           apiVersion: batch/v1
           kind: Job
@@ -274,7 +292,8 @@ jobs:
                             esac
                           done
                         }
-                        URL="mysql://\$(urlenc "\$DB_USER"):\$(urlenc "\$DB_PASSWORD")@tcp(\${DB_HOST}:\${DB_PORT:-3306})/\${DB_NAME}?charset=utf8mb4&parseTime=true"
+                        URL="mysql://\$(urlenc "\$DB_USER"):\$(urlenc "\$DB_PASSWORD")@tcp(\${DB_HOST}:\${DB_PORT:-3306})/\${DB_NAME}?charset=utf8mb4&parseTime=true&x-migrations-table=${MIG_TABLE}"
+                        echo "ledger: ${MIG_TABLE} di database \${DB_NAME}"
                         echo "versi sebelum migrasi:"
                         migrate -path=/migrations -database "\$URL" version || true
                         exec migrate -path=/migrations -database "\$URL" up
