@@ -4,6 +4,11 @@ name: Reusable Frontend deploy to EKS
 # baca env di balik nginx), jadi nilainya diambil dari Vault sebelum build dan
 # dikirim ke Docker sebagai build-args.
 #
+# Konsekuensinya frontend TIDAK bisa mem-promote image dev ke prod seperti
+# deploy-service.yml: image dev sudah mengandung VITE_API_BASE_URL dev di dalam
+# bundle-nya. Jalur prod di sini selalu build ulang, dengan nilai dari
+# secret/prod/<service>.
+#
 # Setup Vault yang dibutuhkan sekali per service - lihat catatan di input
 # `vault_secret_path` di bawah.
 #
@@ -13,18 +18,23 @@ on:
       service_name:
         required: true
         type: string
+      env:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          "dev" atau "prod". Menentukan namespace k8s (default / prod), folder
+          values di helm-charts-v2, dan stage Vault sekaligus. Kalau
+          dikosongkan, dipakai input `namespace` (jalur lama).
       namespace:
         required: false
         type: string
-        default: dev
-        description: >-
-          Folder values di repo helm-charts-v2 (values/<namespace>/<service>.yaml).
-          Helm release-nya sendiri tetap dipasang di namespace k8s "default",
-          sama seperti deploy-service.yml.
+        default: ""
+        description: DEPRECATED - alias lama untuk `env`.
       chart_version:
         required: false
         type: string
-        default: "0.1.2"
+        default: "0.1.3"
       node_version:
         required: false
         type: string
@@ -41,8 +51,9 @@ on:
         type: string
         default: ""
         description: >-
-          Contoh: https://vault-dev.mawarpay.com. Kalau dikosongin, step Vault
-          di-skip dan nilai VITE_* diambil dari input `api_base_url` /
+          Contoh: https://vault-dev.mawarpay.com. Satu Vault dipakai dev dan
+          prod - yang membedakan cuma path secret-nya. Kalau dikosongin, step
+          Vault di-skip dan nilai VITE_* diambil dari input `api_base_url` /
           `extra_build_args` aja.
       vault_mount:
         required: false
@@ -54,14 +65,14 @@ on:
         type: string
         default: ""
         description: >-
-          Path secret di dalam mount, default "<namespace>/<service_name>".
+          Path secret di dalam mount, default "<env>/<service_name>".
           Semua field di path ini dikirim apa adanya sebagai build-arg, jadi
           nama field harus persis sama dengan nama env Vite. Contoh isi:
 
-            vault kv put -mount=secret dev/portal-admin-vue \
-              VITE_API_BASE_URL=https://api-dev.mawarpay.com \
+            vault kv put -mount=secret prod/portal-admin-vue \
+              VITE_API_BASE_URL=https://api.mawarpay.com \
               VITE_SENTRY_DSN=https://xxx@sentry.io/123 \
-              VITE_SENTRY_ENVIRONMENT=dev
+              VITE_SENTRY_ENVIRONMENT=prod
 
           Setiap field juga wajib punya `ARG` dengan nama sama di Dockerfile
           service - build-arg yang nggak dideklarasikan diabaikan Docker.
@@ -93,9 +104,60 @@ on:
 
 env:
   AWS_REGION: ap-southeast-1
+  # Dev dan prod satu cluster - yang memisahkan keduanya adalah namespace.
   CLUSTER_NAME: dev
 
 jobs:
+  # ---------- Job 0: turunkan semua yang bergantung environment ----------
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.resolve.outputs.env }}
+      ns: ${{ steps.resolve.outputs.ns }}
+      vault_store: ${{ steps.resolve.outputs.vault_store }}
+      moving_tag: ${{ steps.resolve.outputs.moving_tag }}
+    steps:
+      - name: Resolve environment
+        id: resolve
+        env:
+          RAW_ENV: ${{ inputs.env }}
+          RAW_NS: ${{ inputs.namespace }}
+        run: |
+          set -euo pipefail
+          ENV="${RAW_ENV:-$RAW_NS}"
+
+          case "$ENV" in
+            dev)
+              NS=default
+              STORE=vault-kv
+              MOVING=latest
+              ;;
+            prod)
+              NS=prod
+              STORE=vault-kv-prod
+              MOVING=prod
+              ;;
+            "")
+              echo '::error::input "env" (atau "namespace") wajib diisi: dev | prod.'
+              exit 1
+              ;;
+            *)
+              echo "::error::environment tidak dikenal: '$ENV'. Yang valid: dev | prod."
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$RAW_ENV" ]; then
+            echo "::warning::Caller masih pakai input 'namespace' yang deprecated. Ganti jadi 'env: $ENV'."
+          fi
+
+          echo "env=$ENV" >> "$GITHUB_OUTPUT"
+          echo "ns=$NS" >> "$GITHUB_OUTPUT"
+          echo "vault_store=$STORE" >> "$GITHUB_OUTPUT"
+          echo "moving_tag=$MOVING" >> "$GITHUB_OUTPUT"
+
+          echo "env=$ENV namespace=$NS store=$STORE"
+
   # ---------- Job 1: test (Node/Vite) ----------
   test:
     runs-on: ubuntu-latest
@@ -121,9 +183,13 @@ jobs:
   # --------- Job 2: build image + deploy ---------
   build-and-deploy:
     runs-on: ubuntu-latest
-    needs: [test]
+    needs: [setup, test]
     # tetap jalan walau job test di-skip (run_tests=false)
-    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    if: always() && needs.setup.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    env:
+      ENV: ${{ needs.setup.outputs.env }}
+      NS: ${{ needs.setup.outputs.ns }}
+      VAULT_STORE: ${{ needs.setup.outputs.vault_store }}
     steps:
       - uses: actions/checkout@v4
 
@@ -150,9 +216,13 @@ jobs:
           VAULT_ADDR: ${{ inputs.vault_addr }}
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
           MOUNT: ${{ inputs.vault_mount }}
-          SECRET_PATH: ${{ inputs.vault_secret_path != '' && inputs.vault_secret_path || format('{0}/{1}', inputs.namespace, inputs.service_name) }}
+          EXPLICIT_PATH: ${{ inputs.vault_secret_path }}
         run: |
           set -euo pipefail
+
+          # Default path ikut environment yang sudah di-resolve, bukan input
+          # mentah - supaya build prod tidak pernah bisa jatuh ke secret/dev/*.
+          SECRET_PATH="${EXPLICIT_PATH:-$ENV/${{ inputs.service_name }}}"
 
           if [ -z "${VAULT_TOKEN:-}" ]; then
             echo "::error::vault_addr diisi tapi secret VAULT_TOKEN kosong. Pastikan caller-nya ngoper VAULT_TOKEN di blok secrets - org secret nggak otomatis kebawa ke reusable workflow."
@@ -211,6 +281,10 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Bundle dev dan prod isinya beda (VITE_* di-bake), jadi tag sha saja
+      # tidak cukup untuk membedakan - tag di-prefix environment supaya image
+      # prod tidak pernah tertimpa build dev untuk commit yang sama.
+      #
       # Urutan build-args = urutan prioritas, yang belakang menimpa yang depan:
       # default workflow -> field Vault -> extra_build_args.
       - name: Build & push image (dengan layer cache)
@@ -219,8 +293,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:${{ github.sha }}
-            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:${{ needs.setup.outputs.env }}-${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}:${{ needs.setup.outputs.moving_tag }}
           # cache layer Docker di GitHub - `npm ci` berikutnya jauh lebih cepat
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -239,6 +313,18 @@ jobs:
           # Kalau helm-charts private, tambahkan fine-grained PAT:
           # token: ${{ secrets.GH_PAT_READ_HELM_CHARTS }}
 
+      - name: Pastikan values environment ada
+        env:
+          SVC: ${{ inputs.service_name }}
+        run: |
+          VALUES="helm-charts/values/$ENV/$SVC.yaml"
+          if [ ! -f "$VALUES" ]; then
+            echo "::error::$VALUES tidak ada di helm-charts-v2."
+            echo "Buat dulu values untuk environment '$ENV' sebelum deploy ke sana."
+            exit 1
+          fi
+          echo "Pakai $VALUES"
+
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
 
@@ -248,14 +334,18 @@ jobs:
           helm registry login --username AWS --password-stdin \
           ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com
 
+      # vault.stage / vault.storeName sengaja dipaksa dari workflow, tidak
+      # dibaca dari file values - lihat catatan yang sama di deploy-service.yml.
       - name: Helm dry-run (debug manifest)
         run: |
           helm upgrade --install ${{ inputs.service_name }} \
           oci://${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/helm/app \
           --version ${{ inputs.chart_version }} \
-          --namespace default --create-namespace \
-          -f helm-charts/values/${{ inputs.namespace }}/${{ inputs.service_name }}.yaml \
-          --set image.tag=${{ github.sha }} \
+          --namespace "$NS" --create-namespace \
+          -f helm-charts/values/$ENV/${{ inputs.service_name }}.yaml \
+          --set image.tag=$ENV-${{ github.sha }} \
+          --set vault.stage=$ENV \
+          --set vault.storeName=$VAULT_STORE \
           --dry-run --debug
 
       - name: Deploy dengan Helm
@@ -263,12 +353,14 @@ jobs:
           helm upgrade --install ${{ inputs.service_name }} \
           oci://${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/helm/app \
           --version ${{ inputs.chart_version }} \
-          --namespace default --create-namespace \
-          -f helm-charts/values/${{ inputs.namespace }}/${{ inputs.service_name }}.yaml \
-          --set image.tag=${{ github.sha }} \
+          --namespace "$NS" --create-namespace \
+          -f helm-charts/values/$ENV/${{ inputs.service_name }}.yaml \
+          --set image.tag=$ENV-${{ github.sha }} \
+          --set vault.stage=$ENV \
+          --set vault.storeName=$VAULT_STORE \
           --wait --timeout 5m
 
       - name: Verifikasi rollout
         run: |
           kubectl rollout status deployment/${{ inputs.service_name }} \
-          -n default --timeout=180s
+          -n "$NS" --timeout=180s
