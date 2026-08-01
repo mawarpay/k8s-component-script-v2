@@ -29,6 +29,25 @@ on:
           Paket apt yang dipasang di runner sebelum go vet/test, dipisah spasi.
           Dipakai service yang punya dependency cgo (misal image-service-api
           butuh "libvips-dev" untuk github.com/h2non/bimg).
+      run_migrations:
+        required: false
+        type: boolean
+        default: true
+        description: >-
+          Jalankan migrasi golang-migrate sebelum deploy. Auto-skip kalau repo
+          tidak punya file .sql di migrations_path, jadi aman dibiarkan true
+          untuk service yang belum punya migrasi. Set false kalau migrasi mau
+          dijalankan manual.
+      migrations_path:
+        required: false
+        type: string
+        default: migrations
+        description: Folder berisi file .up.sql/.down.sql golang-migrate.
+      migrate_version:
+        required: false
+        type: string
+        default: v4.18.1
+        description: Tag image migrate/migrate yang dipakai Job migrasi.
     secrets:
       AWS_ACCESS_KEY_ID:
         required: true
@@ -84,6 +103,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Service yang belum punya folder migrations (mayoritas repo) harus tetap
+      # bisa deploy tanpa mengubah workflow pemanggilnya, jadi keberadaan
+      # migrasi dideteksi di sini dan dipakai sebagai gate semua step migrasi.
+      - name: Deteksi migrations
+        id: migrations
+        env:
+          MIGRATIONS_PATH: ${{ inputs.migrations_path }}
+        run: |
+          if [ "${{ inputs.run_migrations }}" != "true" ]; then
+            echo "run_migrations=false, migrasi dilewati."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$(find "$MIGRATIONS_PATH" -maxdepth 1 -name '*.sql' -print -quit 2>/dev/null)" ]; then
+            echo "Ditemukan $(find "$MIGRATIONS_PATH" -maxdepth 1 -name '*.up.sql' | wc -l) migrasi di '$MIGRATIONS_PATH'."
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tidak ada file .sql di '$MIGRATIONS_PATH', migrasi dilewati."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -95,18 +133,28 @@ jobs:
       - name: Pastikan ECR repository ada
         env:
           SVC: ${{ inputs.service_name }}
+          WITH_MIGRATIONS: ${{ steps.migrations.outputs.found }}
         run: |
-          if aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$SVC" >/dev/null 2>&1; then
-            echo "ECR repository '$SVC' sudah ada."
-          else
-            echo "ECR repository '$SVC' belum ada - membuat..."
-            aws ecr create-repository \
-              --region "$AWS_REGION" \
-              --repository-name "$SVC" \
-              --image-tag-mutability MUTABLE \
-              --encryption-configuration encryptionType=AES256 >/dev/null \
-            || aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$SVC" >/dev/null
-            echo "ECR repository '$SVC' siap."
+          ensure_repo() {
+            if aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$1" >/dev/null 2>&1; then
+              echo "ECR repository '$1' sudah ada."
+            else
+              echo "ECR repository '$1' belum ada - membuat..."
+              aws ecr create-repository \
+                --region "$AWS_REGION" \
+                --repository-name "$1" \
+                --image-tag-mutability MUTABLE \
+                --encryption-configuration encryptionType=AES256 >/dev/null \
+              || aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$1" >/dev/null
+              echo "ECR repository '$1' siap."
+            fi
+          }
+          ensure_repo "$SVC"
+          # Image migrasi dipisah dari image service: image service cuma berisi
+          # binary (lihat Dockerfile tiap service), tidak ada folder migrations
+          # maupun CLI migrate di dalamnya.
+          if [ "$WITH_MIGRATIONS" = "true" ]; then
+            ensure_repo "$SVC-migrations"
           fi
 
       - name: Login ke Amazon ECR
@@ -130,6 +178,27 @@ jobs:
           build-args: |
             GO_VERSION=${{ inputs.go_version }}
 
+      # RDS dev (db-mawarpay-dev) tidak publicly accessible, jadi migrasi tidak
+      # bisa dijalankan langsung dari runner GitHub - harus lewat Job di dalam
+      # cluster. Image kecil ini yang dipakai Job tersebut.
+      - name: Build & push image migrasi
+        if: steps.migrations.outputs.found == 'true'
+        env:
+          MIGRATIONS_PATH: ${{ inputs.migrations_path }}
+          MIGRATE_VERSION: ${{ inputs.migrate_version }}
+        run: |
+          cat > Dockerfile.migrations <<EOF
+          FROM migrate/migrate:${MIGRATE_VERSION}
+          COPY ${MIGRATIONS_PATH} /migrations
+          # Jaga-jaga kalau nanti ada .dockerignore yang meng-exclude folder
+          # migrations: lebih baik gagal di build daripada Job "sukses" tanpa
+          # menjalankan satu migrasi pun.
+          RUN [ -n "\$(ls -A /migrations 2>/dev/null)" ] || { echo "/migrations kosong"; exit 1; }
+          EOF
+          IMG="${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}-migrations:${{ github.sha }}"
+          docker build -f Dockerfile.migrations -t "$IMG" .
+          docker push "$IMG"
+
       - name: Checkout helm values
         uses: actions/checkout@v4
         with:
@@ -140,6 +209,105 @@ jobs:
 
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+
+      # Dijalankan SEBELUM helm upgrade supaya pod versi baru tidak sempat
+      # jalan di atas schema lama. Kalau migrasi gagal, deploy ikut dibatalkan.
+      - name: Jalankan migrasi database (Job in-cluster)
+        if: steps.migrations.outputs.found == 'true'
+        env:
+          SVC: ${{ inputs.service_name }}
+          IMG: ${{ steps.ecr.outputs.registry }}/${{ inputs.service_name }}-migrations:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SECRET="$SVC-vault"
+
+          # Secret ini dibuat ExternalSecret milik chart, jadi belum ada waktu
+          # service dideploy paling pertama.
+          if ! kubectl get secret "$SECRET" -n default >/dev/null 2>&1; then
+            echo "::error::Secret '$SECRET' belum ada di namespace default."
+            echo "Untuk deploy pertama kali: jalankan sekali dengan run_migrations: false"
+            echo "supaya ExternalSecret terbentuk, lalu jalankan ulang workflow-nya."
+            exit 1
+          fi
+
+          JOB="$SVC-migrate-$(echo "${{ github.sha }}" | cut -c1-7)"
+          kubectl delete job "$JOB" -n default --ignore-not-found
+
+          kubectl apply -f - <<EOF
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: $JOB
+            namespace: default
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 600
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: migrate
+                    image: $IMG
+                    envFrom:
+                      - secretRef:
+                          name: $SECRET
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        LC_ALL=C; export LC_ALL
+                        : "\${DB_HOST:?DB_HOST kosong di $SECRET}"
+                        : "\${DB_USER:?DB_USER kosong di $SECRET}"
+                        : "\${DB_PASSWORD:?DB_PASSWORD kosong di $SECRET}"
+                        : "\${DB_NAME:?DB_NAME kosong di $SECRET}"
+                        # Password dari Vault bisa memuat karakter yang merusak
+                        # DSN (@ : / ? #), jadi di-percent-encode dulu.
+                        # Oktal, bukan heks: printf "\\0NNN" dibaca sebagian sh
+                        # sebagai \\0NN + digit sisa, dan \\xNN tidak POSIX.
+                        urlenc() {
+                          printf '%s' "\$1" | od -An -to1 -v | tr -s ' ' '\n' | grep -v '^\$' |
+                          while read -r o; do
+                            c=\$(printf "\\\\\$o")
+                            case "\$c" in
+                              [A-Za-z0-9.~_-]) printf '%s' "\$c" ;;
+                              *) printf '%%%02X' "0\$o" ;;
+                            esac
+                          done
+                        }
+                        URL="mysql://\$(urlenc "\$DB_USER"):\$(urlenc "\$DB_PASSWORD")@tcp(\${DB_HOST}:\${DB_PORT:-3306})/\${DB_NAME}?charset=utf8mb4&parseTime=true"
+                        echo "versi sebelum migrasi:"
+                        migrate -path=/migrations -database "\$URL" version || true
+                        exec migrate -path=/migrations -database "\$URL" up
+          EOF
+
+          echo "Menunggu Job $JOB selesai..."
+          deadline=$(( $(date +%s) + 600 ))
+          state=timeout
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ "$(kubectl get job "$JOB" -n default -o jsonpath='{.status.succeeded}' 2>/dev/null || true)" = "1" ]; then
+              state=ok
+              break
+            fi
+            failed=$(kubectl get job "$JOB" -n default -o jsonpath='{.status.failed}' 2>/dev/null || true)
+            if [ -n "$failed" ] && [ "$failed" != "0" ]; then
+              state=fail
+              break
+            fi
+            sleep 5
+          done
+
+          echo "----- log migrasi -----"
+          kubectl logs "job/$JOB" -n default --tail=300 || true
+          echo "-----------------------"
+
+          if [ "$state" != "ok" ]; then
+            echo "::error::Migrasi $SVC $state - deploy dibatalkan."
+            kubectl describe job "$JOB" -n default || true
+            exit 1
+          fi
+
+          kubectl delete job "$JOB" -n default --ignore-not-found
+          echo "Migrasi $SVC selesai."
 
       - name: Helm login ke ECR
         run: |
