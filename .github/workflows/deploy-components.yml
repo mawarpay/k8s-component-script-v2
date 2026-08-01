@@ -7,7 +7,7 @@ on:
         description: "Komponen yang di-deploy"
         required: true
         type: choice
-        options: [all, ingress-nginx, vault]
+        options: [all, ingress-nginx, vault, secret-stores]
 
 env:
   AWS_REGION: ap-southeast-1
@@ -50,3 +50,13 @@ jobs:
           helm upgrade --install vault hashicorp/vault \
           -n vault --create-namespace \
           -f components/vault/values.yaml
+
+      # ClusterSecretStore per environment. Role Vault "eso-prod" harus sudah
+      # dibuat lebih dulu - lihat components/external-secrets/README.md, bagian
+      # ini tidak bisa diotomatiskan dari sini karena butuh token root Vault.
+      - name: secret-stores
+        if: inputs.component == 'secret-stores' || inputs.component == 'all'
+        run: |
+          kubectl apply -f components/external-secrets/clustersecretstore-dev.yaml
+          kubectl apply -f components/external-secrets/clustersecretstore-prod.yaml
+          kubectl get clustersecretstore
