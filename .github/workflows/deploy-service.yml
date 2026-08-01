@@ -293,10 +293,28 @@ jobs:
                           done
                         }
                         URL="mysql://\$(urlenc "\$DB_USER"):\$(urlenc "\$DB_PASSWORD")@tcp(\${DB_HOST}:\${DB_PORT:-3306})/\${DB_NAME}?charset=utf8mb4&parseTime=true&x-migrations-table=${MIG_TABLE}"
+                        # golang-migrate mencetak DSN utuh - termasuk password -
+                        # pada setiap error koneksi, dan log Job ini terbaca oleh
+                        # siapa pun yang punya akses kubectl atau log workflow.
+                        # Contoh nyata 2026-08-01 di withdraw-service-api:
+                        #   Error 1045: Access denied for user 'admin'
+                        # dicetak bersama DSN lengkapnya. Jadi output migrate
+                        # disaring dulu. Exit code tetap diteruskan apa adanya -
+                        # menelan status gagal jauh lebih berbahaya daripada
+                        # bocornya password.
+                        ENC_PASS=\$(urlenc "\$DB_PASSWORD")
+                        redact() { sed "s|:\${ENC_PASS}@|:***@|g"; }
+
                         echo "ledger: ${MIG_TABLE} di database \${DB_NAME}"
                         echo "versi sebelum migrasi:"
-                        migrate -path=/migrations -database "\$URL" version || true
-                        exec migrate -path=/migrations -database "\$URL" up
+                        migrate -path=/migrations -database "\$URL" version 2>&1 | redact || true
+
+                        set +e
+                        migrate -path=/migrations -database "\$URL" up >/tmp/migrate.log 2>&1
+                        rc=\$?
+                        set -e
+                        redact </tmp/migrate.log
+                        exit \$rc
           EOF
 
           echo "Menunggu Job $JOB selesai..."
