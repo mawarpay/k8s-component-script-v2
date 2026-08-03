@@ -1,8 +1,23 @@
 deploymentMode: SingleBinary
+
 loki:
   auth_enabled: false
   commonConfig:
     replication_factor: 1
+  
+  # 1. batas retensi log agar disk tidak kepenuhan
+  limits_config:
+    retention_period: 7d
+    reject_old_samples: true
+    reject_old_samples_max_age: 168h
+
+  # 2. compactor aktif untuk menghapus log lama sesuai retensi
+  compactor:
+    working_directory: /var/loki/compactor
+    compaction_interval: 10m
+    retention_enabled: true
+    retention_delete_delay: 2h
+
   storage:
     type: filesystem
   schemaConfig:
@@ -18,8 +33,19 @@ loki:
 singleBinary:
   replicas: 1
   persistence:
+    enabled: true
+    storageClass: "gp3-auto"
     size: 20Gi
-    
+  
+  # 3. batas resource agar pod stabil
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
 read:
   replicas: 0
 write:
