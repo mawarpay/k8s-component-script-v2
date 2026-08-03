@@ -1,5 +1,5 @@
 grafana:
-  adminPassword: "ganti-khusus-dev"
+  adminPassword: "devadmin"
   ingress:
     enabled: true
     ingressClassName: nginx
@@ -7,6 +7,7 @@ grafana:
       - grafana-dev.mawarpay.com
   persistence:
     enabled: true
+    storageClassName: "gp3"
     size: 5Gi
 
 prometheus:
@@ -15,6 +16,7 @@ prometheus:
     storageSpec:
       volumeClaimTemplate:
         spec:
+          storageClassName: "gp3"
           resources:
             requests:
               storage: 20Gi
