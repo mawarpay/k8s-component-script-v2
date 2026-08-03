@@ -7,7 +7,7 @@ grafana:
       - grafana-dev.mawarpay.com
   persistence:
     enabled: true
-    storageClassName: "gp3"
+    storageClassName: "gp3-auto"
     size: 5Gi
 
 prometheus:
@@ -16,7 +16,7 @@ prometheus:
     storageSpec:
       volumeClaimTemplate:
         spec:
-          storageClassName: "gp3"
+          storageClassName: "gp3-auto"
           resources:
             requests:
               storage: 20Gi
