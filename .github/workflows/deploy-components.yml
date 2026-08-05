@@ -11,7 +11,7 @@ on:
 
 env:
   AWS_REGION: ap-southeast-1
-  CLUSTER_NAME: dev
+  CLUSTER_NAME: prod
 
 jobs:
   deploy:
